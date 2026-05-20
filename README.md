@@ -1,41 +1,29 @@
-# GitHub 开源项目集合
+# 开源项目集合
 
 本仓库收录我在学习和开发过程中完成的开源项目。
 
 ## 项目列表
+
+### STM32 嵌入式开发技能 (Claude Code Skill)
+- **位置**: `embedded/`
+- **说明**: 通用的 STM32 嵌入式固件开发技能，支持 Keil MDK + STM32CubeMX HAL，自动检测芯片和外设配置
+- **技术栈**: STM32 HAL, Keil MDK, CubeMX, FreeRTOS
 
 ### 文献综述多Agent系统
 - **位置**: `文献综述多Agent系统/`
 - **说明**: 根据用户给定的研究主题，自动制定调研计划、从 Semantic Scholar 和 ArXiv 检索论文、逐篇深度分析、聚类分类并撰写完整综述
 - **技术栈**: Python, DeepSeek API
 
-### STM32 嵌入式开发技能
-- **位置**: `embedded/`
-- **说明**: 通用的 STM32 嵌入式固件开发技能，支持 Keil MDK + STM32CubeMX HAL，自动检测芯片和外设配置
-- **技术栈**: STM32 HAL, Keil MDK, CubeMX, FreeRTOS
-
 ---
 
 ## 结构说明
 
 ```
-GitHub开源项目/
+My-Project/
 ├── README.md               ← 本文件，概述所有项目
-├── 文献综述多Agent系统/
-│   ├── README.md           ← 项目详细说明
-│   └── [项目文件]
-├── embedded/
-│   ├── README.md           ← 项目详细说明
-│   └── [项目文件]
-└── [未来新项目]/
-    ├── README.md
-    └── [项目文件]
+├── embedded/               ← STM32 嵌入式开发技能
+└── 文献综述多Agent系统/    ← 文献综述自动化系统
 ```
-
-**约束**:
-- 根目录只允许存在 README.md 和文件夹
-- 每个项目文件夹必须包含 README.md 作为项目概述
-- 项目文件存放在对应的文件夹内
 
 ---
 

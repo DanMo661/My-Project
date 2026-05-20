@@ -179,6 +179,32 @@ Project/
 
 ---
 
+## Build Verification Loop（代码改完后自动执行）
+
+代码修改完成后，**不要等用户要求**，自动进入编译验证循环。
+
+### 触发条件
+- 新建/重构/移植代码完成后
+- 用户说"编译"、"build"、"看看有没有错"
+
+### 流程
+1. 找到 `.uvprojx` 文件，运行 Keil 命令行编译：
+   ```bash
+   "C:/Keil_v5/UV4/UV4.exe" -b "<path>.uvprojx" -o "<dir>/build_output.txt" -j0
+   ```
+2. 读取 `build_output.txt`，grep `Error:` 统计错误数
+3. 如果 0 errors → 报告 warnings 数，完成
+4. 如果有 errors → 逐条分析、修复、重新编译（连续 3 轮错误数不减少才停止）
+5. 修复时注意全局影响，不要随便删改文件
+
+### 关键规则
+- Exit code 1 = 成功，2 = 有错误，0 = 未编译
+- 同类错误批量修复，不要一个一个来
+- 修头文件前先 grep 确认影响范围
+- 详细协议见 `references/build-loop.md`
+
+---
+
 ## Reference Files
 
 | 文件 | 何时读取 |
@@ -193,3 +219,4 @@ Project/
 | `references/freertos-setup.md` | 添加或调试 FreeRTOS 任务时 |
 | `references/project-documentation.md` | 生成项目文档时 |
 | `references/peripheral-specifics.md` | 用到 ADS1115、MPU6050、HMC5883L、nRF24L01、OLED 时 |
+| `references/build-loop.md` | 代码改完后自动编译验证时 |
