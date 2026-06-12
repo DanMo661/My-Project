@@ -24,9 +24,8 @@ class BaseAgent(ABC):
     - run(): 标准执行模板（调用 execute()，自动日志和异常处理）
     """
 
-    def __init__(self, llm: LLMClient, config: Optional[Any] = None):
+    def __init__(self, llm: LLMClient):
         self.llm = llm
-        self.config = config
         self.log = logging.getLogger(self.__class__.__name__)
 
     # ── 执行接口 ──
@@ -93,12 +92,9 @@ class BaseAgent(ABC):
                 messages=messages, system_prompt=system_prompt,
                 required_keys=required_keys, temperature=temperature,
             )
-        except Exception as e:
-            from errors import LLMError
-            if isinstance(e, (LLMParseError, ValueError, LLMError)):
-                self.log.warning(f"[{context}] LLM 结构化输出失败，使用降级结果: {e}")
-                return fallback
-            raise
+        except (LLMParseError, ValueError) as e:
+            self.log.warning(f"[{context}] LLM 结构化输出失败，使用降级结果: {e}")
+            return fallback
 
     def llm_chat(self, messages: list[dict], system_prompt: str,
                  temperature: float = 0.3,

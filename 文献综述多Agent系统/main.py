@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 
-from config import AppConfig, ConfigError, PROVIDER_PRESETS
+from config import AppConfig, ConfigError, MAX_WORKERS, FILTER_BATCH_SIZE, ANALYZER_BATCH_SIZE, ORGANIZER_MAX_ANALYSES, PROVIDER_PRESETS
 from llm.client import LLMClient
 from agents.coordinator import CoordinatorAgent
 from agents.searcher import SearcherAgent
@@ -28,6 +28,55 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+
+def ensure_output_dir():
+    """确保输出目录存在"""
+    base = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(base, "output")
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
+def write_intermediate(data: dict, filename: str, output_dir: str):
+    """保存中间结果"""
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    log.info(f"已保存: {path}")
+
+
+def parse_args():
+    provider_choices = list(PROVIDER_PRESETS.keys())
+    parser = argparse.ArgumentParser(description="文献综述自动梳理系统")
+    # 必填
+    parser.add_argument("--topic", "-t", required=True, help="综述主题")
+    # 可选
+    parser.add_argument("--extra", "-e", default="", help="额外约束或关注点")
+    parser.add_argument("--api-key", default=None,
+                        help="API Key（也可用环境变量：<PROVIDER>_API_KEY 或 LLM_API_KEY）")
+    parser.add_argument("--provider", "-p", default=None, choices=provider_choices,
+                        help=f"LLM 提供商（也可设 LLM_PROVIDER 环境变量，默认 deepseek）")
+    parser.add_argument("--model", "-m", default=None,
+                        help="模型名称（也可用环境变量：<PROVIDER>_MODEL）")
+    parser.add_argument("--base-url", default=None,
+                        help="API Base URL（也可用环境变量：<PROVIDER>_BASE_URL）")
+    parser.add_argument("--config-file", "-c", default=None,
+                        help="配置文件路径（支持 YAML/JSON）")
+    # 并行
+    parser.add_argument("--workers", "-w", type=int, default=MAX_WORKERS, help="并行线程数（默认 4）")
+    parser.add_argument("--sequential", "-s", action="store_true", help="强制顺序执行（禁用并行）")
+    return parser.parse_args()
+
+
+# ── 阶段索引常量 ──
+STAGE_COORDINATE = 0
+STAGE_SEARCH = 1
+STAGE_FILTER = 2
+STAGE_ANALYZE = 3
+STAGE_ORGANIZE = 4
+STAGE_WRITE = 5
+STAGE_REVIEW = 6
+
 STAGE_NAMES = [
     "协调员制定调研计划",
     "搜索员检索论文",
@@ -38,185 +87,6 @@ STAGE_NAMES = [
     "审校员质量检查",
 ]
 
-CHECKPOINT_FILE = "checkpoint.json"
-
-
-def ensure_output_dir():
-    base = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(base, "output")
-    os.makedirs(output_dir, exist_ok=True)
-    return output_dir
-
-
-def write_json(data, filename, output_dir):
-    path = os.path.join(output_dir, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    log.info(f"已保存: {path}")
-
-
-def read_json(filename, output_dir):
-    path = os.path.join(output_dir, filename)
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_checkpoint(output_dir, stage, data):
-    path = os.path.join(output_dir, CHECKPOINT_FILE)
-    checkpoint = {"completed_stage": stage, "data": data}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(checkpoint, f, ensure_ascii=False, indent=2)
-    log.info(f"断点已保存: 阶段 {stage}")
-
-
-def load_checkpoint(output_dir):
-    path = os.path.join(output_dir, CHECKPOINT_FILE)
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def clear_checkpoint(output_dir):
-    path = os.path.join(output_dir, CHECKPOINT_FILE)
-    if os.path.exists(path):
-        os.remove(path)
-
-
-def parse_args():
-    provider_choices = list(PROVIDER_PRESETS.keys())
-    parser = argparse.ArgumentParser(description="文献综述自动梳理系统")
-    parser.add_argument("--topic", "-t", required=True, help="综述主题")
-    parser.add_argument("--extra", "-e", default="", help="额外约束或关注点")
-    parser.add_argument("--api-key", default=None, help="API Key")
-    parser.add_argument("--provider", "-p", default=None, choices=provider_choices,
-                        help=f"LLM 提供商（默认 deepseek）")
-    parser.add_argument("--model", "-m", default=None, help="模型名称")
-    parser.add_argument("--base-url", default=None, help="API Base URL")
-    parser.add_argument("--config-file", "-c", default=None, help="配置文件路径")
-    parser.add_argument("--workers", "-w", type=int, default=4, help="并行线程数（默认 4）")
-    parser.add_argument("--sequential", "-s", action="store_true", help="强制顺序执行")
-    parser.add_argument("--resume", "-r", action="store_true",
-                        help="从上次中断的断点恢复执行")
-    return parser.parse_args()
-
-
-def run_stage_coordinate(pipeline, llm, config, topic, extra, output_dir):
-    STAGE = 0
-    pipeline.progress.start_stage(STAGE, STAGE_NAMES[STAGE])
-    coordinator = CoordinatorAgent(llm, config)
-    plan = coordinator.run(topic, extra)
-    write_json(plan, "01_plan.json", output_dir)
-    sub_directions = plan.get("sub_directions", [])
-    survey_structure = plan.get("survey_structure", [])
-    pipeline.progress.finish_stage(
-        STAGE, f"{len(sub_directions)} 个子方向，{len(survey_structure)} 个章节",
-    )
-    save_checkpoint(output_dir, STAGE, {
-        "plan": plan,
-        "sub_directions": sub_directions,
-        "survey_structure": survey_structure,
-    })
-    return plan, sub_directions, survey_structure
-
-
-def run_stage_search(pipeline, llm, config, sub_directions, output_dir):
-    STAGE = 1
-    pipeline.progress.start_stage(STAGE, STAGE_NAMES[STAGE])
-    searcher = SearcherAgent(llm, config)
-    raw_papers = searcher.run(sub_directions)
-    pipeline.progress.finish_stage(STAGE, f"共 {len(raw_papers)} 篇")
-    if not raw_papers:
-        return None
-    save_checkpoint(output_dir, STAGE, {"raw_papers": raw_papers})
-    return raw_papers
-
-
-def run_stage_filter(pipeline, llm, config, raw_papers, topic, use_parallel, output_dir):
-    STAGE = 2
-    searcher = SearcherAgent(llm, config)
-    if use_parallel:
-        papers = searcher.filter_papers(raw_papers, topic, pipeline, STAGE)
-    else:
-        pipeline.progress.start_stage(STAGE, STAGE_NAMES[STAGE])
-        papers = searcher.filter_papers(raw_papers, topic)
-        pipeline.progress.advance(STAGE, 1)
-        pipeline.progress.finish_stage(STAGE)
-    write_json(papers, "02_papers.json", output_dir)
-    if not papers:
-        return None
-    save_checkpoint(output_dir, STAGE, {"papers": papers})
-    return papers
-
-
-def run_stage_analyze(pipeline, llm, config, papers, use_parallel, output_dir):
-    STAGE = 3
-    analyzer = AnalyzerAgent(llm, config)
-    if use_parallel:
-        analyses = analyzer.run(papers, pipeline, STAGE)
-    else:
-        pipeline.progress.start_stage(STAGE, STAGE_NAMES[STAGE], len(papers))
-        analyses = analyzer.run(papers)
-        pipeline.progress.finish_stage(STAGE, f"{len(analyses)} 篇")
-    write_json(analyses, "03_analyses.json", output_dir)
-    save_checkpoint(output_dir, STAGE, {"analyses": analyses})
-    return analyses
-
-
-def run_stage_organize(pipeline, llm, config, analyses, survey_structure, use_parallel, output_dir):
-    STAGE = 4
-    organizer = OrganizerAgent(llm, config)
-    if use_parallel:
-        organized = organizer.run(analyses, survey_structure, pipeline, STAGE)
-    else:
-        pipeline.progress.start_stage(STAGE, STAGE_NAMES[STAGE])
-        organized = organizer.run(analyses, survey_structure)
-        pipeline.progress.finish_stage(STAGE)
-    write_json(organized, "04_organized.json", output_dir)
-    save_checkpoint(output_dir, STAGE, {"organized": organized})
-    return organized
-
-
-def run_stage_write(pipeline, llm, config, topic, survey_structure,
-                    clusters, analyses, timeline, research_gaps, output_dir):
-    STAGE = 5
-    pipeline.progress.start_stage(STAGE, STAGE_NAMES[STAGE])
-    writer = WriterAgent(llm, config)
-    survey = writer.run(
-        topic=topic, survey_structure=survey_structure,
-        clusters=clusters, analyses=analyses,
-        timeline=timeline, research_gaps=research_gaps,
-    )
-    draft_path = os.path.join(output_dir, "05_draft.md")
-    with open(draft_path, "w", encoding="utf-8") as f:
-        f.write(survey)
-    pipeline.progress.finish_stage(STAGE)
-    save_checkpoint(output_dir, STAGE, {"survey": survey})
-    return survey
-
-
-def run_stage_review(pipeline, llm, config, survey, output_dir):
-    STAGE = 6
-    pipeline.progress.start_stage(STAGE, STAGE_NAMES[STAGE])
-    reviewer = ReviewerAgent(llm, config)
-    review = reviewer.run(survey)
-    write_json(review, "06_review.json", output_dir)
-
-    score = review.get("score")
-    if score is not None:
-        pipeline.progress.advance(STAGE, 1, f"评分 {score}/10")
-    else:
-        log.warning("审校结果解析失败，跳过评分")
-
-    if score is not None and score < 7:
-        pipeline.progress.advance(STAGE, 1, f"评分 {score} < 7，修改中...")
-        survey = reviewer.refine(survey, review)
-
-    pipeline.progress.finish_stage(STAGE)
-    return survey
-
 
 def main():
     args = parse_args()
@@ -225,6 +95,7 @@ def main():
     print("  文献综述自动梳理系统（并行优化版）")
     print("=" * 60)
 
+    # 从 CLI 参数构建配置
     try:
         app_config = AppConfig.from_sources({
             "provider": args.provider,
@@ -237,6 +108,7 @@ def main():
         if errors:
             for e in errors:
                 print(f"  配置警告: {e}")
+            # Ollama 无 key 也允许通过
             fatal = [e for e in errors if "缺少 API Key" not in e]
             if fatal:
                 raise ConfigError("\n".join(fatal))
@@ -252,100 +124,82 @@ def main():
     print(f"\n{'='*60}")
     print(f"  开始处理: {topic}")
     print(f"  并行模式: {'开启' if use_parallel else '关闭'}（{max_workers} 线程）")
-    print(f"  断点恢复: {'是' if args.resume else '否'}")
     print(app_config.summary())
     print(f"{'='*60}\n")
 
+    # 初始化 LLM 客户端
     llm = LLMClient(config=app_config)
     output_dir = ensure_output_dir()
+
+    # 创建管道执行器
     pipeline = PipelineExecutor(max_workers=max_workers, stages=STAGE_NAMES)
     pipeline.install_signal_handler()
 
     try:
-        checkpoint = None
-        start_stage = 0
-
-        if args.resume:
-            checkpoint = load_checkpoint(output_dir)
-            if checkpoint:
-                start_stage = checkpoint["completed_stage"] + 1
-                print(f"\n  从阶段 {start_stage + 1} 恢复执行（上次完成到阶段 {checkpoint['completed_stage'] + 1}）")
-            else:
-                print("\n  未找到断点，从头开始执行")
-
-        plan = sub_directions = survey_structure = None
-        raw_papers = papers = analyses = None
-        organized = survey = None
-
-        if start_stage <= 0:
-            plan, sub_directions, survey_structure = run_stage_coordinate(
-                pipeline, llm, app_config, topic, extra, output_dir)
-        elif checkpoint:
-            data = checkpoint["data"]
-            plan = data.get("plan")
-            sub_directions = data.get("sub_directions", [])
-            survey_structure = data.get("survey_structure", [])
-            if not sub_directions:
-                saved_plan = read_json("01_plan.json", output_dir)
-                if saved_plan:
-                    plan = saved_plan
-                    sub_directions = saved_plan.get("sub_directions", [])
-                    survey_structure = saved_plan.get("survey_structure", [])
+        # ---- Stage 1: 制定计划 ----
+        pipeline.progress.start_stage(STAGE_COORDINATE, STAGE_NAMES[STAGE_COORDINATE])
+        coordinator = CoordinatorAgent(llm)
+        plan = coordinator.run(topic, extra)
+        write_intermediate(plan, "01_plan.json", output_dir)
+        sub_directions = plan.get("sub_directions", [])
+        survey_structure = plan.get("survey_structure", [])
+        pipeline.progress.finish_stage(
+            STAGE_COORDINATE,
+            f"{len(sub_directions)} 个子方向，{len(survey_structure)} 个章节",
+        )
 
         if pipeline.cancelled:
             return
 
-        if start_stage <= 1:
-            raw_papers = run_stage_search(pipeline, llm, app_config, sub_directions, output_dir)
-            if raw_papers is None:
-                print("警告：未找到论文，请尝试换一组关键词。")
-                return
-        elif checkpoint:
-            data = checkpoint["data"]
-            raw_papers = data.get("raw_papers", [])
-            if not raw_papers:
-                saved_papers = read_json("02_papers.json", output_dir)
-                if saved_papers:
-                    raw_papers = saved_papers
+        # ---- Stage 2: 检索论文 ----
+        pipeline.progress.start_stage(STAGE_SEARCH, STAGE_NAMES[STAGE_SEARCH])
+        searcher = SearcherAgent(llm)
+        raw_papers = searcher.run(sub_directions)
+        pipeline.progress.finish_stage(STAGE_SEARCH, f"共 {len(raw_papers)} 篇")
+
+        if not raw_papers:
+            print("警告：未找到论文，请尝试换一组关键词。")
+            return
+
+        # ---- Stage 3: 筛选相关论文（可并行） ----
+        if use_parallel and len(raw_papers) > FILTER_BATCH_SIZE:
+            papers = searcher.filter_parallel(raw_papers, topic, pipeline, STAGE_FILTER)
+        else:
+            pipeline.progress.start_stage(STAGE_FILTER, STAGE_NAMES[STAGE_FILTER])
+            papers = searcher.filter_relevant(raw_papers, topic)
+            pipeline.progress.advance(STAGE_FILTER, 1)
+            pipeline.progress.finish_stage(STAGE_FILTER)
+        write_intermediate(papers, "02_papers.json", output_dir)
+
+        if not papers:
+            print("警告：筛选后无相关论文，请尝试换关键词。")
+            return
 
         if pipeline.cancelled:
             return
 
-        if start_stage <= 2:
-            papers = run_stage_filter(pipeline, llm, app_config, raw_papers, topic, use_parallel, output_dir)
-            if papers is None:
-                print("警告：筛选后无相关论文，请尝试换关键词。")
-                return
-        elif checkpoint:
-            data = checkpoint["data"]
-            papers = data.get("papers", [])
-            if not papers:
-                saved_papers = read_json("02_papers.json", output_dir)
-                if saved_papers:
-                    papers = saved_papers
+        # ---- Stage 4: 分析论文（可并行） ----
+        analyzer = AnalyzerAgent(llm)
+        if use_parallel and len(papers) > ANALYZER_BATCH_SIZE:
+            analyses = analyzer.analyze_parallel(papers, pipeline, STAGE_ANALYZE)
+        else:
+            pipeline.progress.start_stage(STAGE_ANALYZE, STAGE_NAMES[STAGE_ANALYZE], len(papers))
+            analyses = analyzer.run(papers)
+            pipeline.progress.finish_stage(STAGE_ANALYZE, f"{len(analyses)} 篇")
+        write_intermediate(analyses, "03_analyses.json", output_dir)
 
         if pipeline.cancelled:
             return
 
-        if start_stage <= 3:
-            analyses = run_stage_analyze(pipeline, llm, app_config, papers, use_parallel, output_dir)
-        elif checkpoint:
-            data = checkpoint["data"]
-            analyses = data.get("analyses", [])
-            if not analyses:
-                saved_analyses = read_json("03_analyses.json", output_dir)
-                if saved_analyses:
-                    analyses = saved_analyses
-
-        if pipeline.cancelled:
-            return
-
-        if start_stage <= 4:
-            organized = run_stage_organize(
-                pipeline, llm, app_config, analyses, survey_structure, use_parallel, output_dir)
-        elif checkpoint:
-            data = checkpoint["data"]
-            organized = data.get("organized", {})
+        # ---- Stage 5: 聚类组织（可并行） ----
+        organizer = OrganizerAgent(llm)
+        if use_parallel and len(analyses) > ORGANIZER_MAX_ANALYSES:
+            organized = organizer.organize_parallel(analyses, survey_structure, pipeline, STAGE_ORGANIZE)
+        else:
+            pipeline.progress.start_stage(STAGE_ORGANIZE, STAGE_NAMES[STAGE_ORGANIZE])
+            organized = organizer.run(analyses, survey_structure)
+            pipeline.progress.finish_stage(STAGE_ORGANIZE)
+        write_intermediate(organized, "04_organized.json", output_dir)
 
         clusters = organized.get("clusters", [])
         research_gaps = organized.get("research_gaps", [])
@@ -354,25 +208,50 @@ def main():
         if pipeline.cancelled:
             return
 
-        if start_stage <= 5:
-            survey = run_stage_write(
-                pipeline, llm, app_config, topic, survey_structure,
-                clusters, analyses, timeline, research_gaps, output_dir)
-        elif checkpoint:
-            data = checkpoint["data"]
-            survey = data.get("survey", "")
+        # ---- Stage 6: 撰写综述 ----
+        pipeline.progress.start_stage(STAGE_WRITE, STAGE_NAMES[STAGE_WRITE])
+        writer = WriterAgent(llm)
+        survey = writer.run(
+            topic=topic,
+            survey_structure=survey_structure,
+            clusters=clusters,
+            analyses=analyses,
+            timeline=timeline,
+            research_gaps=research_gaps,
+        )
+        draft_path = os.path.join(output_dir, "05_draft.md")
+        with open(draft_path, "w", encoding="utf-8") as f:
+            f.write(survey)
+        pipeline.progress.finish_stage(STAGE_WRITE)
 
         if pipeline.cancelled:
             return
 
-        if start_stage <= 6:
-            survey = run_stage_review(pipeline, llm, app_config, survey, output_dir)
+        # ---- Stage 7: 审校 ----
+        pipeline.progress.start_stage(STAGE_REVIEW, STAGE_NAMES[STAGE_REVIEW])
+        reviewer = ReviewerAgent(llm)
+        review = reviewer.run(survey)
+        write_intermediate(review, "06_review.json", output_dir)
 
+        score = review.get("score")
+        if score is not None:
+            pipeline.progress.advance(STAGE_REVIEW, 1, f"评分 {score}/10")
+        else:
+            log.warning("审校结果解析失败，跳过评分")
+
+        # 如果需要改进
+        if score is not None and score < 7:
+            pipeline.progress.advance(STAGE_REVIEW, 1, f"评分 {score} < 7，修改中...")
+            survey = reviewer.refine(survey, review)
+
+        pipeline.progress.finish_stage(STAGE_REVIEW)
+
+        # 保存最终版
         final_path = os.path.join(output_dir, "07_final_survey.md")
         with open(final_path, "w", encoding="utf-8") as f:
             f.write(survey)
 
-        clear_checkpoint(output_dir)
+        # ---- 完成 ----
         pipeline.progress.summary()
 
         print(f"\n{'='*60}")
@@ -384,6 +263,9 @@ def main():
         print(f"  聚类结果: {os.path.join(output_dir, '04_organized.json')}")
         print(f"\n共检索 {len(raw_papers)} 篇论文，分析 {len(analyses)} 篇，")
         print(f"聚类 {len(clusters)} 个类别，识别 {len(research_gaps)} 个研究空白。\n")
+
+        # 成本摘要
+        print(llm.cost_tracker.summary())
 
     except KeyboardInterrupt:
         print("\n\n用户中断，已停止。")
@@ -417,6 +299,7 @@ def main():
         sys.exit(10)
     finally:
         pipeline.uninstall_signal_handler()
+        # 即使中断也打印成本摘要
         if hasattr(llm, 'cost_tracker') and llm.cost_tracker.call_count > 0:
             print(llm.cost_tracker.summary())
 

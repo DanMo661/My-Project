@@ -1,7 +1,5 @@
 """论文检索工具：Semantic Scholar + ArXiv"""
 
-import re
-import string
 import time
 import logging
 import requests
@@ -28,43 +26,6 @@ def _is_retryable_status(status_code: int) -> bool:
 def _wait_retry(attempt: int, base: float = 2.0):
     """指数退避等待"""
     time.sleep(base * (attempt + 1))
-
-
-def _normalize_title(title: str) -> str:
-    t = title.lower().strip()
-    t = t.translate(str.maketrans("", "", string.punctuation))
-    t = " ".join(t.split())
-    return t
-
-
-_DOI_PATTERN = re.compile(r"^10\.\d{4,}/")
-
-
-def _extract_doi(paper: dict) -> str:
-    ext = paper.get("external_ids") or {}
-    doi = ext.get("DOI", "")
-    if doi:
-        return doi.lower().strip()
-    paper_id = paper.get("id", "")
-    if _DOI_PATTERN.match(paper_id):
-        return paper_id.lower().strip()
-    return ""
-
-
-def _extract_url_id(paper: dict) -> str:
-    url = paper.get("url", "")
-    if not url:
-        return ""
-    if "arxiv.org" in url:
-        parts = url.rstrip("/").split("/")
-        for i, part in enumerate(parts):
-            if part in ("abs", "pdf"):
-                if i + 1 < len(parts):
-                    return parts[i + 1].replace(".pdf", "")
-        return parts[-1].replace(".pdf", "")
-    if "semanticscholar.org" in url:
-        return url.rstrip("/").split("/")[-1]
-    return ""
 
 
 class PaperSearchTool:
@@ -96,32 +57,16 @@ class PaperSearchTool:
             log.warning(f"所有来源均未返回结果，关键词: {query}")
             return []
 
-        seen_dois: set[str] = set()
-        seen_titles: set[str] = set()
-        seen_url_ids: set[str] = set()
+        # 去重（按title）
+        seen = set()
         deduped = []
-
         for p in all_papers:
-            doi = _extract_doi(p)
-            norm_title = _normalize_title(p.get("title", ""))
-            url_id = _extract_url_id(p)
+            key = p.get("title", "").lower().strip()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(p)
 
-            if doi and doi in seen_dois:
-                continue
-            if norm_title and norm_title in seen_titles:
-                continue
-            if url_id and url_id in seen_url_ids:
-                continue
-
-            if doi:
-                seen_dois.add(doi)
-            if norm_title:
-                seen_titles.add(norm_title)
-            if url_id:
-                seen_url_ids.add(url_id)
-            deduped.append(p)
-
-        log.info(f"去重后共 {len(deduped)} 篇论文 (DOI/title/URL多维去重)")
+        log.info(f"去重后共 {len(deduped)} 篇论文")
         return deduped[:max_results]
 
     def _search_semantic_scholar(self, query: str, limit: int = 20) -> list[dict]:

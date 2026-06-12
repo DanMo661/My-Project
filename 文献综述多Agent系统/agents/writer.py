@@ -2,16 +2,12 @@
 
 import json
 import logging
+import config
 from agents.base import BaseAgent
-
-from typing import Optional, Any
 
 log = logging.getLogger(__name__)
 
-_DEFAULTS = {
-    "writer_max_papers": 40,
-    "writer_max_tokens": 8192,
-}
+MAX_PAPERS_FOR_WRITER = config.WRITER_MAX_PAPERS
 
 WRITER_SYSTEM = """你是一个科研综述撰写专家。根据论文分析和聚类结果，撰写高质量的领域综述。
 
@@ -28,8 +24,14 @@ WRITER_SYSTEM = """你是一个科研综述撰写专家。根据论文分析和�
 
 def _select_top_papers(analyses: list[dict], clusters: list[dict],
                        max_count: int) -> list[dict]:
+    """按 cluster 比例采样论文，保证覆盖度"""
     if len(analyses) <= max_count:
         return analyses
+
+    cluster_titles = set()
+    for c in clusters:
+        for t in c.get("papers", []):
+            cluster_titles.add(t.strip().lower())
 
     per_cluster = max(2, max_count // max(1, len(clusters)))
     selected = []
@@ -60,6 +62,7 @@ def _select_top_papers(analyses: list[dict], clusters: list[dict],
 
 
 def _build_ref_list(analyses: list[dict]) -> str:
+    """构建参考文献编号列表"""
     lines = []
     for j, a in enumerate(analyses):
         authors = a.get("authors", [])
@@ -71,24 +74,14 @@ def _build_ref_list(analyses: list[dict]) -> str:
 class WriterAgent(BaseAgent):
     """综述撰写"""
 
-    def __init__(self, llm, config: Optional[Any] = None):
-        super().__init__(llm, config)
-
-    def _cfg(self, key: str):
-        if self.config and hasattr(self.config, key):
-            return getattr(self.config, key)
-        return _DEFAULTS[key]
-
     def run(self, topic: str, survey_structure: list[str],
             clusters: list[dict], analyses: list[dict],
             timeline: list[dict], research_gaps: list[dict]) -> str:
+        """撰写完整综述"""
         self.validate_non_empty_str(topic, "topic")
         self.validate_papers(analyses, "analyses")
 
-        max_papers = self._cfg("writer_max_papers")
-        max_tokens = self._cfg("writer_max_tokens")
-
-        selected = _select_top_papers(analyses, clusters, max_papers)
+        selected = _select_top_papers(analyses, clusters, MAX_PAPERS_FOR_WRITER)
         ref_list = _build_ref_list(selected)
 
         clusters_text = json.dumps(clusters, ensure_ascii=False, indent=2)
@@ -110,9 +103,10 @@ class WriterAgent(BaseAgent):
             messages=[{"role": "user", "content": prompt}],
             system_prompt=WRITER_SYSTEM,
             temperature=0.3,
-            max_tokens=max_tokens,
+            max_tokens=config.WRITER_MAX_TOKENS,
         )
 
+        # 添加参考文献附录
         result += "\n\n---\n## 参考文献\n\n"
         for j, a in enumerate(selected):
             authors = a.get("authors", [])
