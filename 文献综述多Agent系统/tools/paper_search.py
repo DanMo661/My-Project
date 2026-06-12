@@ -1,5 +1,7 @@
 """论文检索工具：Semantic Scholar + ArXiv"""
 
+import re
+import string
 import time
 import logging
 import requests
@@ -7,12 +9,71 @@ import xml.etree.ElementTree as ET
 
 log = logging.getLogger(__name__)
 
+MAX_RETRIES = 3
+REQUEST_TIMEOUT = 30
+
+
+def _validate_query(query: str) -> str:
+    """验证并清理搜索关键词"""
+    if not query or not query.strip():
+        raise ValueError("搜索关键词不能为空")
+    return query.strip()
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    """判断 HTTP 状态码是否可重试"""
+    return status_code in (429, 500, 502, 503, 504)
+
+
+def _wait_retry(attempt: int, base: float = 2.0):
+    """指数退避等待"""
+    time.sleep(base * (attempt + 1))
+
+
+def _normalize_title(title: str) -> str:
+    t = title.lower().strip()
+    t = t.translate(str.maketrans("", "", string.punctuation))
+    t = " ".join(t.split())
+    return t
+
+
+_DOI_PATTERN = re.compile(r"^10\.\d{4,}/")
+
+
+def _extract_doi(paper: dict) -> str:
+    ext = paper.get("external_ids") or {}
+    doi = ext.get("DOI", "")
+    if doi:
+        return doi.lower().strip()
+    paper_id = paper.get("id", "")
+    if _DOI_PATTERN.match(paper_id):
+        return paper_id.lower().strip()
+    return ""
+
+
+def _extract_url_id(paper: dict) -> str:
+    url = paper.get("url", "")
+    if not url:
+        return ""
+    if "arxiv.org" in url:
+        parts = url.rstrip("/").split("/")
+        for i, part in enumerate(parts):
+            if part in ("abs", "pdf"):
+                if i + 1 < len(parts):
+                    return parts[i + 1].replace(".pdf", "")
+        return parts[-1].replace(".pdf", "")
+    if "semanticscholar.org" in url:
+        return url.rstrip("/").split("/")[-1]
+    return ""
+
 
 class PaperSearchTool:
     """多源论文检索"""
 
     def search(self, query: str, max_results: int = 20) -> list[dict]:
         """从多个来源检索论文，去重合并"""
+        query = _validate_query(query)
+        max_results = max(1, min(max_results, 100))
         all_papers = []
 
         # Semantic Scholar
@@ -31,20 +92,39 @@ class PaperSearchTool:
         except Exception as e:
             log.warning(f"ArXiv 搜索失败: {e}")
 
-        # 去重（按title）
-        seen = set()
-        deduped = []
-        for p in all_papers:
-            key = p.get("title", "").lower().strip()
-            if key and key not in seen:
-                seen.add(key)
-                deduped.append(p)
+        if not all_papers:
+            log.warning(f"所有来源均未返回结果，关键词: {query}")
+            return []
 
-        log.info(f"去重后共 {len(deduped)} 篇论文")
+        seen_dois: set[str] = set()
+        seen_titles: set[str] = set()
+        seen_url_ids: set[str] = set()
+        deduped = []
+
+        for p in all_papers:
+            doi = _extract_doi(p)
+            norm_title = _normalize_title(p.get("title", ""))
+            url_id = _extract_url_id(p)
+
+            if doi and doi in seen_dois:
+                continue
+            if norm_title and norm_title in seen_titles:
+                continue
+            if url_id and url_id in seen_url_ids:
+                continue
+
+            if doi:
+                seen_dois.add(doi)
+            if norm_title:
+                seen_titles.add(norm_title)
+            if url_id:
+                seen_url_ids.add(url_id)
+            deduped.append(p)
+
+        log.info(f"去重后共 {len(deduped)} 篇论文 (DOI/title/URL多维去重)")
         return deduped[:max_results]
 
-    def _search_semantic_scholar(self, query: str, limit: int = 20,
-                                  retries: int = 3) -> list[dict]:
+    def _search_semantic_scholar(self, query: str, limit: int = 20) -> list[dict]:
         """Semantic Scholar API 搜索（带重试和退避）"""
         url = "https://api.semanticscholar.org/graph/v1/paper/search"
         params = {
@@ -53,59 +133,68 @@ class PaperSearchTool:
             "fields": "title,authors,year,abstract,externalIds,url,citationCount,venue,publicationDate",
         }
 
-        for attempt in range(retries):
+        last_error = None
+        for attempt in range(MAX_RETRIES):
             try:
-                resp = requests.get(url, params=params, timeout=30)
+                resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
 
-                if resp.status_code == 429:
-                    if attempt >= 2:
-                        log.warning("Semantic Scholar 限流，改用 arXiv 作为主要来源")
-                        return []
+                if resp.status_code == 200:
+                    return self._parse_semantic_scholar_response(resp.json())
+
+                if _is_retryable_status(resp.status_code):
                     wait = 3 * (attempt + 1)
-                    log.warning(f"Semantic Scholar 限流，等待 {wait}s")
+                    log.warning(f"Semantic Scholar 返回 {resp.status_code} (第 {attempt + 1} 次)，等待 {wait}s")
+                    last_error = RuntimeError(f"Semantic Scholar HTTP {resp.status_code}")
                     time.sleep(wait)
                     continue
 
-                if resp.status_code != 200:
-                    log.warning(f"Semantic Scholar 返回 {resp.status_code}")
-                    if attempt < retries - 1:
-                        time.sleep(2)
-                        continue
-                    return []
-
-                data = resp.json()
-                papers = []
-                for p in data.get("data", []):
-                    papers.append({
-                        "id": p.get("paperId", ""),
-                        "title": p.get("title", ""),
-                        "year": p.get("year"),
-                        "abstract": p.get("abstract", ""),
-                        "authors": [a.get("name", "") for a in p.get("authors", [])],
-                        "url": p.get("url", ""),
-                        "citations": p.get("citationCount", 0),
-                        "venue": p.get("venue", ""),
-                        "date": p.get("publicationDate", ""),
-                        "source": "semantic_scholar",
-                        "external_ids": p.get("externalIds", {}),
-                    })
-                return papers
-
-            except requests.Timeout:
-                log.warning(f"Semantic Scholar 超时 (第{attempt+1}次重试)")
-                time.sleep(3)
-                continue
-            except Exception as e:
-                log.warning(f"Semantic Scholar 错误: {e}")
-                if attempt < retries - 1:
-                    time.sleep(2)
-                    continue
+                # 不可重试的错误
+                log.warning(f"Semantic Scholar 返回 {resp.status_code}，不重试")
                 return []
 
+            except requests.Timeout:
+                last_error = RuntimeError("Semantic Scholar 请求超时")
+                log.warning(f"Semantic Scholar 超时 (第 {attempt + 1} 次)")
+                _wait_retry(attempt)
+                continue
+            except requests.ConnectionError as e:
+                last_error = RuntimeError(f"Semantic Scholar 连接失败: {e}")
+                log.warning(f"Semantic Scholar 连接错误 (第 {attempt + 1} 次): {e}")
+                _wait_retry(attempt)
+                continue
+            except Exception as e:
+                last_error = RuntimeError(f"Semantic Scholar 未知错误: {e}")
+                log.warning(f"Semantic Scholar 错误 (第 {attempt + 1} 次): {e}")
+                _wait_retry(attempt)
+                continue
+
+        log.warning(f"Semantic Scholar 重试耗尽: {last_error}")
         return []
 
+    @staticmethod
+    def _parse_semantic_scholar_response(data: dict) -> list[dict]:
+        """解析 Semantic Scholar API 响应"""
+        papers = []
+        for p in data.get("data", []):
+            if not p.get("title"):
+                continue
+            papers.append({
+                "id": p.get("paperId", ""),
+                "title": p.get("title", ""),
+                "year": p.get("year"),
+                "abstract": p.get("abstract", ""),
+                "authors": [a.get("name", "") for a in p.get("authors", [])],
+                "url": p.get("url", ""),
+                "citations": p.get("citationCount", 0),
+                "venue": p.get("venue", ""),
+                "date": p.get("publicationDate", ""),
+                "source": "semantic_scholar",
+                "external_ids": p.get("externalIds", {}),
+            })
+        return papers
+
     def _search_arxiv(self, query: str, max_results: int = 10) -> list[dict]:
-        """ArXiv API 搜索"""
+        """ArXiv API 搜索（带重试）"""
         url = "https://export.arxiv.org/api/query"
         params = {
             "search_query": f"all:{query}",
@@ -114,15 +203,58 @@ class PaperSearchTool:
             "sortBy": "relevance",
             "sortOrder": "descending",
         }
-        resp = requests.get(url, params=params, timeout=30)
 
-        papers = []
-        root = ET.fromstring(resp.text)
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
+                if resp.status_code != 200:
+                    if _is_retryable_status(resp.status_code):
+                        last_error = RuntimeError(f"ArXiv HTTP {resp.status_code}")
+                        log.warning(f"ArXiv 返回 {resp.status_code} (第 {attempt + 1} 次)")
+                        _wait_retry(attempt)
+                        continue
+                    log.warning(f"ArXiv 返回 {resp.status_code}，不重试")
+                    return []
+
+                return self._parse_arxiv_response(resp.text)
+
+            except requests.Timeout:
+                last_error = RuntimeError("ArXiv 请求超时")
+                log.warning(f"ArXiv 超时 (第 {attempt + 1} 次)")
+                _wait_retry(attempt)
+                continue
+            except requests.ConnectionError as e:
+                last_error = RuntimeError(f"ArXiv 连接失败: {e}")
+                log.warning(f"ArXiv 连接错误 (第 {attempt + 1} 次): {e}")
+                _wait_retry(attempt)
+                continue
+            except ET.ParseError as e:
+                last_error = RuntimeError(f"ArXiv XML 解析失败: {e}")
+                log.warning(f"ArXiv XML 解析错误 (第 {attempt + 1} 次): {e}")
+                # XML 解析错误可能是内容不完整，重试可能有效
+                _wait_retry(attempt)
+                continue
+            except Exception as e:
+                last_error = RuntimeError(f"ArXiv 未知错误: {e}")
+                log.warning(f"ArXiv 错误 (第 {attempt + 1} 次): {e}")
+                _wait_retry(attempt)
+                continue
+
+        log.warning(f"ArXiv 重试耗尽: {last_error}")
+        return []
+
+    @staticmethod
+    def _parse_arxiv_response(xml_text: str) -> list[dict]:
+        """解析 ArXiv XML 响应"""
+        root = ET.fromstring(xml_text)
         ns = {
             "atom": "http://www.w3.org/2005/Atom",
             "arxiv": "http://arxiv.org/schemas/atom",
         }
 
+        papers = []
         for entry in root.findall("atom:entry", ns):
             title = entry.find("atom:title", ns)
             summary = entry.find("atom:summary", ns)
@@ -130,14 +262,22 @@ class PaperSearchTool:
             arxiv_id = entry.find("atom:id", ns)
             authors = entry.findall("atom:author", ns)
 
+            title_text = title.text.strip().replace("\n", " ") if title is not None and title.text else ""
+            if not title_text:
+                continue
+
             papers.append({
-                "id": arxiv_id.text.strip() if arxiv_id is not None else "",
-                "title": title.text.strip().replace("\n", " ") if title is not None else "",
-                "abstract": summary.text.strip().replace("\n", " ") if summary is not None else "",
-                "authors": [a.find("atom:name", ns).text for a in authors if a.find("atom:name", ns) is not None],
-                "year": published.text[:4] if published is not None else None,
-                "date": published.text[:10] if published is not None else "",
-                "url": arxiv_id.text.strip() if arxiv_id is not None else "",
+                "id": arxiv_id.text.strip() if arxiv_id is not None and arxiv_id.text else "",
+                "title": title_text,
+                "abstract": summary.text.strip().replace("\n", " ") if summary is not None and summary.text else "",
+                "authors": [
+                    a.find("atom:name", ns).text
+                    for a in authors
+                    if a.find("atom:name", ns) is not None and a.find("atom:name", ns).text
+                ],
+                "year": published.text[:4] if published is not None and published.text else None,
+                "date": published.text[:10] if published is not None and published.text else "",
+                "url": arxiv_id.text.strip() if arxiv_id is not None and arxiv_id.text else "",
                 "citations": 0,
                 "venue": "arXiv",
                 "source": "arxiv",

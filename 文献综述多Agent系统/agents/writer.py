@@ -2,13 +2,16 @@
 
 import json
 import logging
-import config
-from llm.client import LLMClient
 from agents.base import BaseAgent
+
+from typing import Optional, Any
 
 log = logging.getLogger(__name__)
 
-MAX_PAPERS_FOR_WRITER = config.WRITER_MAX_PAPERS
+_DEFAULTS = {
+    "writer_max_papers": 40,
+    "writer_max_tokens": 8192,
+}
 
 WRITER_SYSTEM = """你是一个科研综述撰写专家。根据论文分析和聚类结果，撰写高质量的领域综述。
 
@@ -25,17 +28,9 @@ WRITER_SYSTEM = """你是一个科研综述撰写专家。根据论文分析和�
 
 def _select_top_papers(analyses: list[dict], clusters: list[dict],
                        max_count: int) -> list[dict]:
-    """按 cluster 比例采样论文，保证覆盖度"""
     if len(analyses) <= max_count:
         return analyses
 
-    # 收集每个 cluster 中的论文标题
-    cluster_titles = set()
-    for c in clusters:
-        for t in c.get("papers", []):
-            cluster_titles.add(t.strip().lower())
-
-    # 按 cluster 分配名额
     per_cluster = max(2, max_count // max(1, len(clusters)))
     selected = []
     selected_ids = set()
@@ -53,7 +48,6 @@ def _select_top_papers(analyses: list[dict], clusters: list[dict],
                 selected_ids.add(pid)
                 selected.append(p)
 
-    # 补齐剩余名额（从未选中的论文中按 innovation_score 降序取）
     if len(selected) < max_count:
         remaining = [a for a in analyses
                      if (a.get("paper_id") or a.get("title", "")) not in selected_ids]
@@ -66,7 +60,6 @@ def _select_top_papers(analyses: list[dict], clusters: list[dict],
 
 
 def _build_ref_list(analyses: list[dict]) -> str:
-    """构建参考文献编号列表"""
     lines = []
     for j, a in enumerate(analyses):
         authors = a.get("authors", [])
@@ -78,15 +71,24 @@ def _build_ref_list(analyses: list[dict]) -> str:
 class WriterAgent(BaseAgent):
     """综述撰写"""
 
+    def __init__(self, llm, config: Optional[Any] = None):
+        super().__init__(llm, config)
+
+    def _cfg(self, key: str):
+        if self.config and hasattr(self.config, key):
+            return getattr(self.config, key)
+        return _DEFAULTS[key]
+
     def run(self, topic: str, survey_structure: list[str],
             clusters: list[dict], analyses: list[dict],
             timeline: list[dict], research_gaps: list[dict]) -> str:
-        """撰写完整综述"""
+        self.validate_non_empty_str(topic, "topic")
+        self.validate_papers(analyses, "analyses")
 
-        # 超量时裁剪论文
-        selected = _select_top_papers(analyses, clusters, MAX_PAPERS_FOR_WRITER)
+        max_papers = self._cfg("writer_max_papers")
+        max_tokens = self._cfg("writer_max_tokens")
 
-        # 为论文编号
+        selected = _select_top_papers(analyses, clusters, max_papers)
         ref_list = _build_ref_list(selected)
 
         clusters_text = json.dumps(clusters, ensure_ascii=False, indent=2)
@@ -103,18 +105,19 @@ class WriterAgent(BaseAgent):
             f"请根据以上信息，撰写一篇完整的中文领域综述。要求引用的文献用 [编号] 标注。"
         )
 
-        result = self.llm.chat(
+        self.report_progress("开始撰写综述", papers=len(selected))
+        result = self.llm_chat(
             messages=[{"role": "user", "content": prompt}],
             system_prompt=WRITER_SYSTEM,
             temperature=0.3,
-            max_tokens=config.WRITER_MAX_TOKENS,
+            max_tokens=max_tokens,
         )
 
-        # 添加参考文献附录
         result += "\n\n---\n## 参考文献\n\n"
         for j, a in enumerate(selected):
             authors = a.get("authors", [])
             author_str = "、".join(authors[:5]) if authors else "Unknown"
             result += f"[{j+1}] {author_str}, {a.get('year', '')}. {a.get('title', '')}.\n"
 
+        self.report_progress("综述撰写完成", length=len(result))
         return result

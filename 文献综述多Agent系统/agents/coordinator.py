@@ -1,11 +1,7 @@
 """Coordinator Agent：制定调研计划"""
 
-import logging
-import sys
-from llm.client import LLMClient, check_structured
 from agents.base import BaseAgent
-
-log = logging.getLogger(__name__)
+from errors import ValidationError
 
 COORDINATOR_SYSTEM = """你是一个科研综述协调员。你的职责是：
 1. 根据用户给定的主题，制定详细的调研计划
@@ -35,22 +31,30 @@ COORDINATOR_SYSTEM = """你是一个科研综述协调员。你的职责是：
 class CoordinatorAgent(BaseAgent):
     """制定综述调研计划"""
 
+    def __init__(self, llm, config=None):
+        super().__init__(llm, config)
+
     def run(self, topic: str, extra_context: str = "") -> dict:
-        """制定计划"""
+        """制定计划（直接覆写 run，不走 execute 模板）"""
+        topic = self.validate_non_empty_str(topic, "topic")
+
         user_msg = f"研究主题：{topic}\n"
         if extra_context:
             user_msg += f"额外信息：{extra_context}\n"
 
-        result = self.llm.structured_output(
+        result = self.llm_structured(
             messages=[{"role": "user", "content": user_msg}],
             system_prompt=COORDINATOR_SYSTEM,
+            required_keys=["sub_directions", "survey_structure"],
         )
 
-        try:
-            check_structured(result, ["sub_directions", "survey_structure"], "CoordinatorAgent")
-        except RuntimeError as e:
-            log.error(str(e))
-            sys.exit(1)
+        # 验证 sub_directions 非空
+        sub_directions = result.get("sub_directions", [])
+        if not sub_directions:
+            raise ValidationError("CoordinatorAgent: LLM 返回的 sub_directions 为空")
 
-        log.info(f"协调员计划完成：{len(result.get('sub_directions', []))} 个子方向")
+        self.report_progress(
+            "计划完成",
+            sub_directions=len(sub_directions),
+        )
         return result

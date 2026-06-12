@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>文献综述系统</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo">
+      <img src="https://cdn.cnbj1.fds.api.mi-img.com/aife/mimo-blog-fe/doc_build/mimo.ico" alt="MiMo" class="icon">
+      <h1>文献综述<span class="dim">自动生成</span></h1>
+    </div>
+    <div class="status-badge" id="statusBadge">就绪</div>
+  </header>
+
+  <main>
+    <section class="input-panel">
+      <h2>开始研究</h2>
+      <div class="form-group">
+        <label>研究主题</label>
+        <input type="text" id="topic" placeholder="例：大语言模型在代码生成中的应用" />
+      </div>
+      <div class="form-group">
+        <label>额外约束 <span class="dim">(可选)</span></label>
+        <input type="text" id="extra" placeholder="例：重点关注2024年后的最新进展" />
+      </div>
+      <div class="form-row">
+        <div class="form-group small">
+          <label>并行线程数</label>
+          <input type="number" id="workers" value="2" min="1" max="8" />
+        </div>
+        <button class="btn-primary" id="runBtn" onclick="startPipeline()">开始生成</button>
+      </div>
+    </section>
+
+    <section class="progress-panel" id="progressPanel" style="display:none">
+      <h2>执行进度</h2>
+      <div class="pipeline-stages" id="pipelineStages">
+        <div class="stage" data-stage="0"><span class="dot"></span>制定调研计划</div>
+        <div class="stage" data-stage="1"><span class="dot"></span>检索论文</div>
+        <div class="stage" data-stage="2"><span class="dot"></span>筛选相关论文</div>
+        <div class="stage" data-stage="3"><span class="dot"></span>深度分析</div>
+        <div class="stage" data-stage="4"><span class="dot"></span>聚类分类</div>
+        <div class="stage" data-stage="5"><span class="dot"></span>撰写综述</div>
+        <div class="stage" data-stage="6"><span class="dot"></span>质量审查</div>
+      </div>
+      <div class="log-box" id="logBox"></div>
+    </section>
+
+    <section class="results-panel" id="resultsPanel" style="display:none">
+      <h2>生成结果</h2>
+      <div class="tabs">
+        <button class="tab active" onclick="showTab('survey')">综述全文</button>
+        <button class="tab" onclick="showTab('papers')">论文列表</button>
+        <button class="tab" onclick="showTab('clusters')">聚类分析</button>
+        <button class="tab" onclick="showTab('review')">审校报告</button>
+      </div>
+      <div class="tab-content" id="tabContent"></div>
+    </section>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
