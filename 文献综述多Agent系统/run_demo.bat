@@ -1,12 +1,12 @@
 @echo off
-chcp 65001 >/dev/null
+chcp 65001 >NUL
 echo ========================================
 echo   文献综述自动梳理系统 - 启动脚本
 echo ========================================
 echo.
 
 REM 检查 Python
-python --version >/dev/null 2>&1
+python --version >NUL 2>&1
 if errorlevel 1 (
     echo [错误] 未找到 Python，请先安装 Python 3.8+
     pause
@@ -15,7 +15,7 @@ if errorlevel 1 (
 
 REM 检查依赖
 echo [1/3] 检查依赖...
-pip show requests >/dev/null 2>&1
+pip show requests >NUL 2>&1
 if errorlevel 1 (
     echo [2/3] 安装依赖...
     pip install -r requirements.txt

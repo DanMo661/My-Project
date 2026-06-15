@@ -65,7 +65,6 @@ def api_run():
 
         try:
             env = os.environ.copy()
-            env["DEEPSEEK_API_KEY"] = "sk-09f508e1d3c14380b23ed34a4206cdbf"
 
             cmd = [
                 sys.executable, "main.py",

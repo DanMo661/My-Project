@@ -1,7 +1,9 @@
 # 核心依赖
 requests>=2.31
-openai>=1.0
 pyyaml>=6.0
+
+# Web UI（运行 web/server.py 时需要）
+flask>=3.0
 
 # 可选：Anthropic Claude 支持（用 anthropic 提供商时需要）
 # anthropic>=0.25

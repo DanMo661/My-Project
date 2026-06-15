@@ -31,9 +31,6 @@ COORDINATOR_SYSTEM = """你是一个科研综述协调员。你的职责是：
 class CoordinatorAgent(BaseAgent):
     """制定综述调研计划"""
 
-    def __init__(self, llm, config=None):
-        super().__init__(llm, config)
-
     def run(self, topic: str, extra_context: str = "") -> dict:
         """制定计划（直接覆写 run，不走 execute 模板）"""
         topic = self.validate_non_empty_str(topic, "topic")
